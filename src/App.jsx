@@ -11,12 +11,11 @@ const PALETTE = [
 ];
 
 const MAX_DPR = 2;
-const INITIAL_BUBBLES = 11;
-const MAX_BUBBLES = 16;
-const READY_THRESHOLD = 0.78;
-const PERFECT_THRESHOLD = 0.92;
+const INITIAL_BUBBLES = 34;
+const MAX_BUBBLES = 52;
+const MIN_BUBBLES = 30;
 
-let audioContext = null;
+let audioEngine = null;
 let uid = 0;
 
 function debugLog(...args) {
@@ -31,22 +30,125 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
-function getAudioContext() {
+function getAudioEngine() {
   try {
     const AudioCtor = window.AudioContext || window.webkitAudioContext;
     if (!AudioCtor) return null;
 
-    if (!audioContext) audioContext = new AudioCtor();
+    if (!audioEngine) {
+      const ctx = new AudioCtor();
+      const master = ctx.createGain();
+      const compressor = ctx.createDynamicsCompressor();
+      const ambience = ctx.createGain();
+      const feedback = ctx.createGain();
+      const delay = ctx.createDelay(0.42);
+      const delayFeedback = ctx.createGain();
+      const delayFilter = ctx.createBiquadFilter();
 
-    if (audioContext.state === "suspended") {
-      audioContext.resume().catch(() => {});
+      master.gain.value = 0.9;
+      ambience.gain.value = 0.0001;
+      feedback.gain.value = 0.72;
+
+      compressor.threshold.value = -24;
+      compressor.knee.value = 22;
+      compressor.ratio.value = 5;
+      compressor.attack.value = 0.012;
+      compressor.release.value = 0.18;
+
+      delay.delayTime.value = 0.095;
+      delayFeedback.gain.value = 0.08;
+      delayFilter.type = "lowpass";
+      delayFilter.frequency.value = 2400;
+
+      ambience.connect(master);
+      feedback.connect(master);
+      feedback.connect(delay);
+      delay.connect(delayFilter);
+      delayFilter.connect(delayFeedback);
+      delayFeedback.connect(delay);
+      delayFilter.connect(master);
+      master.connect(compressor);
+      compressor.connect(ctx.destination);
+
+      audioEngine = {
+        ctx,
+        ambience,
+        feedback,
+        started: false,
+        ambientNodes: [],
+        lastNotReadyAt: 0,
+      };
     }
 
-    return audioContext;
+    if (audioEngine.ctx.state === "suspended") {
+      audioEngine.ctx.resume().catch(() => {});
+    }
+
+    return audioEngine;
   } catch (error) {
     debugLog("Audio indisponible", error);
     return null;
   }
+}
+
+function ensureAmbient(soundEnabled) {
+  if (!soundEnabled) return;
+
+  const engine = getAudioEngine();
+  if (!engine || engine.started) return;
+
+  try {
+    const { ctx, ambience } = engine;
+    const now = ctx.currentTime;
+    const partials = [
+      { frequency: 192, gain: 0.004, type: "sine" },
+      { frequency: 288, gain: 0.003, type: "triangle" },
+      { frequency: 384, gain: 0.0025, type: "sine" },
+    ];
+
+    for (const partial of partials) {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const filter = ctx.createBiquadFilter();
+
+      oscillator.type = partial.type;
+      oscillator.frequency.value = partial.frequency;
+      oscillator.detune.value = random(-5, 5);
+      filter.type = "lowpass";
+      filter.frequency.value = 540 + partial.frequency;
+      gain.gain.value = partial.gain;
+
+      oscillator.connect(filter);
+      filter.connect(gain);
+      gain.connect(ambience);
+      oscillator.start(now);
+      engine.ambientNodes.push({ oscillator, gain, filter, baseGain: partial.gain });
+    }
+
+    ambience.gain.setValueAtTime(0.0001, now);
+    ambience.gain.exponentialRampToValueAtTime(0.012, now + 0.45);
+    engine.started = true;
+  } catch (error) {
+    debugLog("Ambiance indisponible", error);
+  }
+}
+
+function updateAmbient(calmIndex, soundEnabled, paused) {
+  const engine = audioEngine;
+  if (!engine || !engine.started) return;
+
+  const { ctx, ambience, ambientNodes } = engine;
+  const now = ctx.currentTime;
+  const target = soundEnabled && !paused ? 0.004 + calmIndex * 0.012 : 0.0001;
+
+  ambience.gain.cancelScheduledValues(now);
+  ambience.gain.setTargetAtTime(target, now, soundEnabled ? 0.7 : 0.18);
+
+  ambientNodes.forEach((node, index) => {
+    const sway = 1 + Math.sin(now * (0.14 + index * 0.035) + index * 1.7) * 0.16;
+    node.gain.gain.setTargetAtTime(node.baseGain * sway * (0.72 + calmIndex * 0.55), now, 0.45);
+    node.filter.frequency.setTargetAtTime(420 + calmIndex * 520 + index * 130, now, 0.7);
+  });
 }
 
 function createNoiseBuffer(ctx, duration = 0.12) {
@@ -62,6 +164,31 @@ function createNoiseBuffer(ctx, duration = 0.12) {
   return buffer;
 }
 
+function makeDestination(engine, pan = 0, wet = 0.16) {
+  const { ctx, feedback } = engine;
+  const output = ctx.createGain();
+  const dry = ctx.createGain();
+  const send = ctx.createGain();
+  const panner = ctx.createStereoPanner?.();
+
+  dry.gain.value = 1;
+  send.gain.value = wet;
+
+  output.connect(dry);
+  output.connect(send);
+
+  if (panner) {
+    panner.pan.value = clamp(pan, -0.85, 0.85);
+    dry.connect(panner);
+    panner.connect(feedback);
+  } else {
+    dry.connect(feedback);
+  }
+
+  send.connect(feedback);
+  return output;
+}
+
 function playTone({
   frequency,
   volume,
@@ -69,16 +196,24 @@ function playTone({
   type = "sine",
   sweepTo = null,
   delay = 0,
+  pan = 0,
+  attack = 0.012,
+  wet = 0.15,
+  filterStart = 4200,
+  filterEnd = 1300,
+  q = 0.52,
   destination = null,
 }) {
-  const ctx = getAudioContext();
-  if (!ctx) return;
+  const engine = getAudioEngine();
+  if (!engine) return;
 
   try {
+    const { ctx } = engine;
     const now = ctx.currentTime + delay;
     const oscillator = ctx.createOscillator();
     const gain = ctx.createGain();
     const filter = ctx.createBiquadFilter();
+    const out = destination || makeDestination(engine, pan, wet);
 
     oscillator.type = type;
     oscillator.frequency.setValueAtTime(frequency, now);
@@ -88,16 +223,17 @@ function playTone({
     }
 
     filter.type = "lowpass";
-    filter.frequency.setValueAtTime(2600, now);
-    filter.frequency.exponentialRampToValueAtTime(1200, now + duration);
+    filter.frequency.setValueAtTime(filterStart, now);
+    filter.frequency.exponentialRampToValueAtTime(filterEnd, now + duration);
+    filter.Q.setValueAtTime(q, now);
 
     gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(volume, now + 0.018);
+    gain.gain.exponentialRampToValueAtTime(volume, now + attack);
     gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
     oscillator.connect(filter);
     filter.connect(gain);
-    gain.connect(destination || ctx.destination);
+    gain.connect(out);
 
     oscillator.start(now);
     oscillator.stop(now + duration + 0.03);
@@ -106,83 +242,186 @@ function playTone({
   }
 }
 
-function playSoftBreath(volume = 0.025) {
-  const ctx = getAudioContext();
-  if (!ctx) return;
+function playNoiseGesture({ volume = 0.025, duration = 0.18, frequency = 820, q = 0.8, pan = 0, wet = 0.12 } = {}) {
+  const engine = getAudioEngine();
+  if (!engine) return;
 
   try {
+    const { ctx } = engine;
     const now = ctx.currentTime;
     const noise = ctx.createBufferSource();
     const gain = ctx.createGain();
     const filter = ctx.createBiquadFilter();
+    const out = makeDestination(engine, pan, wet);
 
-    noise.buffer = createNoiseBuffer(ctx, 0.18);
+    noise.buffer = createNoiseBuffer(ctx, duration);
     filter.type = "bandpass";
-    filter.frequency.setValueAtTime(820, now);
-    filter.Q.setValueAtTime(0.8, now);
+    filter.frequency.setValueAtTime(frequency, now);
+    filter.Q.setValueAtTime(q, now);
 
     gain.gain.setValueAtTime(0.0001, now);
     gain.gain.exponentialRampToValueAtTime(volume, now + 0.025);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.17);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration * 0.94);
 
     noise.connect(filter);
     filter.connect(gain);
-    gain.connect(ctx.destination);
+    gain.connect(out);
 
     noise.start(now);
-    noise.stop(now + 0.19);
+    noise.stop(now + duration + 0.02);
   } catch (error) {
     debugLog("Erreur souffle", error);
   }
 }
 
-function playSatisfyingPop(colorIndex, quality, soundEnabled) {
-  if (!soundEnabled) return;
-
-  const ctx = getAudioContext();
-  if (!ctx) return;
-
-  const base = 235 + colorIndex * 42;
-  const roundness = clamp(quality, 0, 1);
-
-  // Couche 1 : ploc grave et rond.
-  playTone({
-    frequency: base + 55,
-    volume: 0.065 + roundness * 0.035,
-    duration: 0.28,
-    type: "sine",
-    sweepTo: Math.max(80, base * 0.48),
-  });
-
-  // Couche 2 : harmonique douce.
-  playTone({
-    frequency: base * 1.5,
-    volume: 0.035 + roundness * 0.025,
-    duration: 0.32,
-    type: "sine",
-    sweepTo: base * 1.2,
-    delay: 0.018,
-  });
-
-  // Couche 3 : petit éclat cristallin si le timing est bon.
-  if (roundness > 0.72) {
-    playTone({
-      frequency: base * 2.25,
-      volume: 0.018 + roundness * 0.018,
-      duration: 0.42,
-      type: "triangle",
-      sweepTo: base * 2.75,
-      delay: 0.055,
-    });
-  }
-
-  // Couche 4 : souffle court, filtré.
-  playSoftBreath(0.012 + roundness * 0.014);
+function playSoftBreath(volume = 0.025, pan = 0) {
+  playNoiseGesture({ volume, pan });
 }
 
-function playGentleNotReady(soundEnabled) {
+function playSatisfyingPop(colorIndex, quality, soundEnabled, x = 0.5) {
   if (!soundEnabled) return;
-  playSoftBreath(0.018);
+
+  ensureAmbient(soundEnabled);
+
+  const base = 285 + colorIndex * 38 + random(-18, 18);
+  const roundness = clamp(quality, 0, 1);
+  const pan = clamp((x - 0.5) * 1.35, -0.75, 0.75);
+  const style = Math.floor(random(0, 3));
+
+  if (style === 0) {
+    playPopSound(base, roundness, pan);
+  } else if (style === 1) {
+    playPupSound(base, roundness, pan);
+  } else {
+    playPipSound(base, roundness, pan);
+  }
+}
+
+function playPopSound(base, roundness, pan) {
+  playNoiseGesture({
+    volume: 0.014 + roundness * 0.01,
+    duration: 0.045,
+    frequency: 950,
+    q: 1.4,
+    pan,
+    wet: 0.015,
+  });
+
+  playTone({
+    frequency: base * 1.06,
+    volume: 0.07 + roundness * 0.035,
+    duration: 0.115,
+    type: "sine",
+    sweepTo: base * 0.54,
+    pan,
+    attack: 0.003,
+    wet: 0.018,
+    filterStart: 3600,
+    filterEnd: 1250,
+    q: 0.3,
+  });
+
+  playTone({
+    frequency: base * 2.05,
+    volume: 0.018 + roundness * 0.016,
+    duration: 0.09,
+    type: "triangle",
+    sweepTo: base * 1.45,
+    delay: 0.012,
+    pan,
+    attack: 0.004,
+    wet: 0.02,
+    filterStart: 5200,
+    filterEnd: 1800,
+  });
+}
+
+function playPupSound(base, roundness, pan) {
+  playTone({
+    frequency: base * 0.82,
+    volume: 0.08 + roundness * 0.035,
+    duration: 0.13,
+    type: "sine",
+    sweepTo: base * 0.38,
+    pan,
+    attack: 0.002,
+    wet: 0.012,
+    filterStart: 3000,
+    filterEnd: 720,
+    q: 0.25,
+  });
+
+  playNoiseGesture({
+    volume: 0.018 + roundness * 0.008,
+    duration: 0.052,
+    frequency: 620,
+    q: 1.8,
+    pan,
+    wet: 0.01,
+  });
+}
+
+function playPipSound(base, roundness, pan) {
+  playTone({
+    frequency: base * 2.2,
+    volume: 0.044 + roundness * 0.03,
+    duration: 0.075,
+    type: "triangle",
+    sweepTo: base * 2.95,
+    pan,
+    attack: 0.002,
+    wet: 0.018,
+    filterStart: 7200,
+    filterEnd: 3000,
+    q: 0.75,
+  });
+
+  playTone({
+    frequency: base * 3.25,
+    volume: 0.018 + roundness * 0.012,
+    duration: 0.06,
+    type: "sine",
+    sweepTo: base * 3.9,
+    delay: 0.018,
+    pan: -pan * 0.35,
+    attack: 0.003,
+    wet: 0.012,
+    filterStart: 7800,
+    filterEnd: 4200,
+    q: 0.65,
+  });
+
+  playNoiseGesture({
+    volume: 0.008 + roundness * 0.006,
+    duration: 0.034,
+    frequency: 2600,
+    q: 2.2,
+    pan,
+    wet: 0.006,
+  });
+}
+
+function playGentleNotReady(soundEnabled, x = 0.5) {
+  if (!soundEnabled) return;
+  ensureAmbient(soundEnabled);
+
+  const engine = audioEngine;
+  const now = engine?.ctx.currentTime ?? 0;
+  if (engine && now - engine.lastNotReadyAt < 0.08) return;
+  if (engine) engine.lastNotReadyAt = now;
+
+  const pan = clamp((x - 0.5) * 1.1, -0.65, 0.65);
+  playTone({
+    frequency: 180,
+    volume: 0.024,
+    duration: 0.18,
+    type: "sine",
+    sweepTo: 136,
+    pan,
+    attack: 0.018,
+    wet: 0.08,
+  });
+  playSoftBreath(0.014, pan);
 }
 
 function vibrate(ms = 8) {
@@ -199,7 +438,7 @@ class Bubble {
     this.width = width;
     this.height = height;
 
-    this.radius = options.radius ?? random(28, 58);
+    this.radius = options.radius ?? random(18, 48);
     this.x = options.x ?? random(this.radius + 16, Math.max(this.radius + 16, width - this.radius - 16));
     this.y = options.y ?? height + this.radius + random(20, 180);
 
@@ -210,7 +449,7 @@ class Bubble {
     this.driftPhase = random(0, Math.PI * 2);
     this.driftSpeed = random(0.008, 0.017);
 
-    const speed = random(0.18, 0.42);
+    const speed = random(0.12, 0.34);
     const angle = -Math.PI / 2 + random(-0.42, 0.42);
     this.vx = Math.cos(angle) * speed;
     this.vy = Math.sin(angle) * speed;
@@ -229,8 +468,7 @@ class Bubble {
   getReadiness() {
     const breath = this.getBreath();
     const ageFactor = clamp(this.age / 170, 0, 1);
-    const readiness = clamp((breath - READY_THRESHOLD) / (1 - READY_THRESHOLD), 0, 1);
-    return readiness * ageFactor;
+    return (0.42 + breath * 0.58) * ageFactor;
   }
 
   update(pointer, calmIndex) {
@@ -299,7 +537,7 @@ class Bubble {
     const radius = this.radius * this.scale * breathingScale * responseScale;
 
     const alpha = this.opacity * (0.74 + calmIndex * 0.24);
-    const glowStrength = this.patienceGlow;
+    const glowStrength = 0.28 + breath * 0.34 + this.responding * 0.2;
     const haloSize = radius * (1.8 + glowStrength * 1.05);
 
     ctx.save();
@@ -349,10 +587,10 @@ class Bubble {
     ctx.fillStyle = highlight;
     ctx.fill();
 
-    if (readiness > 0.78) {
+    if (readiness > 0.48) {
       ctx.save();
       ctx.rotate(this.phase * 0.15);
-      ctx.globalAlpha = (readiness - 0.78) / 0.22;
+      ctx.globalAlpha = 0.22 + readiness * 0.5;
       ctx.strokeStyle = `hsla(${color.h + 20}, 100%, 88%, 0.52)`;
       ctx.lineWidth = 1.2;
       ctx.beginPath();
@@ -478,6 +716,7 @@ function makeState(width, height) {
     backgroundTime: 0,
     spawnTimer: 0,
     lastActionTime: 0,
+    combo: 0,
     soundEnabled: true,
     paused: false,
   };
@@ -551,43 +790,54 @@ function drawBackground(ctx, state) {
   ctx.globalAlpha = 1;
 }
 
-function spawnBubble(state) {
-  state.bubbles.push(new Bubble(state.width, state.height));
+function spawnBubble(state, visible = false) {
+  state.bubbles.push(
+    new Bubble(
+      state.width,
+      state.height,
+      visible
+        ? {
+            y: random(state.height * 0.16, state.height * 0.92),
+            opacity: random(0.35, 0.78),
+            scale: random(0.45, 0.82),
+            age: random(40, 180),
+          }
+        : {}
+    )
+  );
 }
 
-function popReadyBubble(bubble, state) {
-  const readiness = bubble.getReadiness();
-  const quality = clamp((readiness - READY_THRESHOLD) / (1 - READY_THRESHOLD), 0.45, 1);
+function keepBubbleFieldFull(state, amount = 1) {
+  const livingCount = state.bubbles.filter((bubble) => bubble.alive).length;
+  const missing = Math.max(0, MIN_BUBBLES - livingCount);
+  const spawnCount = Math.min(MAX_BUBBLES - livingCount, amount + missing);
+
+  for (let i = 0; i < spawnCount; i += 1) {
+    spawnBubble(state, true);
+  }
+}
+
+function popBubble(bubble, state) {
+  const now = performance.now();
+  state.combo = now - state.lastActionTime < 850 ? Math.min(state.combo + 1, 8) : 1;
+  state.lastActionTime = now;
+  const quality = clamp(0.82 + state.combo * 0.025 + bubble.radius / 260, 0.82, 1);
 
   bubble.alive = false;
 
-  const particleCount = Math.floor(18 + bubble.radius * 0.85);
+  const particleCount = Math.floor(28 + bubble.radius * 1.25 + state.combo * 2);
   for (let i = 0; i < particleCount; i += 1) {
     state.particles.push(new Particle(bubble.x, bubble.y, bubble.colorIndex));
   }
 
-  for (let i = 0; i < 4; i += 1) {
+  for (let i = 0; i < 5; i += 1) {
     state.particles.push(new Particle(bubble.x, bubble.y, bubble.colorIndex, { ring: true }));
   }
 
-  state.ambientTarget = clamp(state.ambientTarget + 0.045 + quality * 0.035, 0.25, 1);
-  playSatisfyingPop(bubble.colorIndex, quality, state.soundEnabled);
-  vibrate(readiness > PERFECT_THRESHOLD ? 18 : 9);
-  spawnBubble(state);
-}
-
-function respondNotReady(bubble, state, x, y) {
-  bubble.nudgeAwayFrom(x, y);
-
-  state.particles.push(new Particle(x, y, bubble.colorIndex, { ring: true, soft: true }));
-  for (let i = 0; i < 7; i += 1) {
-    state.particles.push(new Particle(x, y, bubble.colorIndex, { soft: true }));
-  }
-
-  // Ce n’est pas une punition : le monde ne se ferme pas, il ne s’apaise simplement pas davantage.
-  state.ambientTarget = clamp(state.ambientTarget - 0.004, 0.25, 1);
-  playGentleNotReady(state.soundEnabled);
-  vibrate(5);
+  state.ambientTarget = clamp(state.ambientTarget + 0.035 + quality * 0.025, 0.25, 1);
+  playSatisfyingPop(bubble.colorIndex, quality, state.soundEnabled, bubble.x / state.width);
+  vibrate(state.combo > 4 ? 16 : 9);
+  keepBubbleFieldFull(state, state.combo > 3 ? 3 : 2);
 }
 
 export default function App() {
@@ -600,7 +850,7 @@ export default function App() {
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [paused, setPaused] = useState(false);
   const [showGuide, setShowGuide] = useState(true);
-  const [phrase, setPhrase] = useState("Observe une bulle. Attends qu’elle devienne lumineuse.");
+  const [phrase, setPhrase] = useState("Touche les bulles. Elles éclatent tout de suite.");
 
   useEffect(() => {
     soundEnabledRef.current = soundEnabled;
@@ -623,12 +873,14 @@ export default function App() {
 
     resizeCanvas(canvas, state);
     setShowGuide(true);
-    setPhrase("Observe une bulle. Attends qu’elle devienne lumineuse.");
+    setPhrase("Touche les bulles. Elles éclatent tout de suite.");
   }, []);
 
   const toggleSound = useCallback(() => {
-    getAudioContext();
-    setSoundEnabled((previous) => !previous);
+    setSoundEnabled((previous) => {
+      if (!previous) ensureAmbient(true);
+      return !previous;
+    });
   }, []);
 
   const togglePause = useCallback(() => {
@@ -657,14 +909,15 @@ export default function App() {
       state.paused = pausedRef.current;
 
       drawBackground(ctx, state);
+      updateAmbient(state.calmIndex, state.soundEnabled, state.paused);
 
       if (!state.paused) {
         state.spawnTimer += dt;
 
         const livingCount = state.bubbles.filter((bubble) => bubble.alive).length;
-        if (state.spawnTimer > 1900 && livingCount < MAX_BUBBLES) {
+        if (state.spawnTimer > 360 && livingCount < MAX_BUBBLES) {
           state.spawnTimer = 0;
-          spawnBubble(state);
+          keepBubbleFieldFull(state, 1);
         }
 
         state.bubbles = state.bubbles.filter((bubble) => bubble.alive);
@@ -708,33 +961,26 @@ export default function App() {
     }
 
     function handlePointerDown(event) {
-      getAudioContext();
+      ensureAmbient(state.soundEnabled);
 
       const point = toCanvasPoint(event);
       state.pointer.x = point.x;
       state.pointer.y = point.y;
       state.pointer.active = true;
-      state.lastActionTime = performance.now();
-
       setShowGuide(false);
 
       const candidates = [...state.bubbles].sort((a, b) => a.radius - b.radius);
       for (const bubble of candidates) {
         if (!bubble.alive || bubble.opacity < 0.3 || !bubble.hits(point.x, point.y)) continue;
 
-        if (bubble.getReadiness() >= READY_THRESHOLD) {
-          popReadyBubble(bubble, state);
-          setPhrase("Bien. Tu as attendu le moment lumineux.");
-        } else {
-          respondNotReady(bubble, state, point.x, point.y);
-          setPhrase("La bulle continue à respirer.");
-        }
+        popBubble(bubble, state);
+        setPhrase(state.combo > 4 ? "Jolie rafale de pops." : "Pop.");
 
         return;
       }
 
       state.particles.push(new Particle(point.x, point.y, 0, { ring: true, soft: true }));
-      playGentleNotReady(state.soundEnabled);
+      playGentleNotReady(state.soundEnabled, point.x / state.width);
     }
 
     function handlePointerLeave() {
@@ -786,9 +1032,9 @@ export default function App() {
       {showGuide && (
         <section className="guide" aria-label="Guide de démarrage">
           <div className="guide-card">
-            <div className="guide-title">Observe</div>
+            <div className="guide-title">Pop pop pop</div>
             <div className="guide-text">
-              Les bulles respirent. Quand l’une devient lumineuse, touche-la doucement.
+              Touche n'importe quelle bulle. Elle éclate tout de suite.
             </div>
           </div>
         </section>
@@ -797,7 +1043,7 @@ export default function App() {
       <section className="bottom-hint" aria-label="Indication douce">
         <span>Pas de score</span>
         <span>Pas de chrono</span>
-        <span>Juste attendre le bon moment</span>
+        <span>Juste des bulles à éclater</span>
       </section>
     </main>
   );
